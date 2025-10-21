@@ -1,4 +1,4 @@
-import io, json, base64, os
+import io, json, base64
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -9,45 +9,52 @@ pillow_heif.register_heif_opener()
 import numpy as np
 import torch
 import torch.nn.functional as F
-import bcrypt  # ✅ for password hashing
-import requests
-from io import BytesIO
+import bcrypt
+import gdown  # ✅ safer model download
 
 # =========================================================
-# 📦 MODEL CONFIGURATION
+# 📦 CONFIGURATION
 # =========================================================
 APP_DIR = Path(__file__).parent
-CFG_PATH   = APP_DIR / "model_config.json"
+MODEL_PATH = APP_DIR / "model_ts.pt"
+CFG_PATH = APP_DIR / "model_config.json"
 USERS_FILE = APP_DIR / "users.txt"
 
+# =========================================================
+# ⚙️ LOAD MODEL CONFIG
+# =========================================================
 cfg = json.loads(CFG_PATH.read_text())
 IMG_SIZE = int(cfg["img_size"])
-MEAN     = np.array(cfg["mean"], dtype=np.float32)
-STD      = np.array(cfg["std"], dtype=np.float32)
+MEAN = np.array(cfg["mean"], dtype=np.float32)
+STD = np.array(cfg["std"], dtype=np.float32)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ✅ Download model from Google Drive
-MODEL_URL = "https://drive.google.com/uc?export=download&id=10ITq1tMY6k6-kwRa4_SHrNs8hVxaDl06"
+# =========================================================
+# 📥 DOWNLOAD MODEL FROM GOOGLE DRIVE
+# =========================================================
+MODEL_URL = "https://drive.google.com/uc?id=10ITq1tMY6k6-kwRa4_SHrNs8hVxaDl06"
 
 try:
-    print("📥 Downloading model from Google Drive...")
-    response = requests.get(MODEL_URL)
-    response.raise_for_status()
-    model = torch.jit.load(BytesIO(response.content), map_location=device).eval()
-    print("✅ Model loaded successfully from Google Drive.")
+    if not MODEL_PATH.exists():
+        print("⬇️ Downloading model from Google Drive using gdown...")
+        gdown.download(MODEL_URL, str(MODEL_PATH), quiet=False)
+
+    print("✅ Loading model...")
+    model = torch.jit.load(str(MODEL_PATH), map_location=device).eval()
+    print("✅ Model loaded successfully.")
 except Exception as e:
     model = None
-    print("⚠️ Failed to load model:", e)
+    print("❌ Failed to load model:", e)
 
 # =========================================================
-# ⚙️ FASTAPI SETUP
+# 🚀 FASTAPI SETUP
 # =========================================================
 app = FastAPI(title="VitGreen API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this to your domain if needed
+    allow_origins=["*"],  # 🔒 Change to your Netlify/Frontend URL in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,8 +72,9 @@ def read_users():
                     username, hashed_pw = line.strip().split(":", 1)
                     users[username] = hashed_pw
     except FileNotFoundError:
-        print("❌ users.txt not found in server directory.")
+        print("❌ users.txt not found.")
     return users
+
 
 @app.post("/login")
 async def login(username: str = Form(...), password: str = Form(...)):
@@ -89,7 +97,7 @@ async def login(username: str = Form(...), password: str = Form(...)):
 # =========================================================
 # 🌿 GVI ANALYSIS ENDPOINT
 # =========================================================
-def preprocess(pil_img: Image.Image) -> tuple[torch.Tensor, Image.Image]:
+def preprocess(pil_img: Image.Image):
     base = pil_img.convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
     arr = np.asarray(base).astype(np.float32) / 255.0
     arr = (arr - MEAN) / STD
@@ -97,40 +105,48 @@ def preprocess(pil_img: Image.Image) -> tuple[torch.Tensor, Image.Image]:
     x = torch.from_numpy(chw).unsqueeze(0).to(device)
     return x, base
 
+
 def overlay_rgba(base: Image.Image, mask01: np.ndarray, alpha: float = 0.45) -> Image.Image:
     green = Image.new("RGBA", base.size, (0, 255, 0, int(alpha * 255)))
     m = Image.fromarray((mask01 * 255).astype(np.uint8), mode="L").resize(base.size, Image.NEAREST)
     green.putalpha(m)
     return Image.alpha_composite(base.convert("RGBA"), green).convert("RGB")
 
+
 @app.post("/gvi")
 async def gvi_endpoint(file: UploadFile = File(...)):
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded on server")
 
-    content = await file.read()
-    pil = Image.open(io.BytesIO(content)).convert("RGB")
+    try:
+        content = await file.read()
+        pil = Image.open(io.BytesIO(content)).convert("RGB")
 
-    x, base = preprocess(pil)
-    with torch.no_grad():
-        out = model(x)
-        if isinstance(out, (list, tuple)):
-            out = out[0]
-        if out.shape[-1] != IMG_SIZE or out.shape[-2] != IMG_SIZE:
-            out = F.interpolate(out, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False)
-        pred = torch.argmax(out, dim=1)[0].cpu().numpy().astype(np.uint8)
+        x, base = preprocess(pil)
 
-    gvi = float((pred == 1).sum() / pred.size)
-    over = overlay_rgba(base, pred, alpha=0.45)
+        with torch.no_grad():
+            out = model(x)
+            if isinstance(out, (list, tuple)):
+                out = out[0]
+            if out.shape[-1] != IMG_SIZE or out.shape[-2] != IMG_SIZE:
+                out = F.interpolate(out, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False)
+            pred = torch.argmax(out, dim=1)[0].cpu().numpy().astype(np.uint8)
 
-    buf = io.BytesIO()
-    over.save(buf, format="JPEG", quality=90)
-    overlay_b64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        gvi = float((pred == 1).sum() / pred.size)
+        over = overlay_rgba(base, pred, alpha=0.45)
 
-    return JSONResponse({"gvi": gvi, "overlay": overlay_b64})
+        buf = io.BytesIO()
+        over.save(buf, format="JPEG", quality=90)
+        overlay_b64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+        return JSONResponse({"gvi": gvi, "overlay": overlay_b64})
+
+    except Exception as e:
+        print("❌ Error during analysis:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =========================================================
-# ✅ ROOT ROUTE
+# 🏠 ROOT ROUTE
 # =========================================================
 @app.get("/")
 def root():
