@@ -119,37 +119,36 @@ async def gvi_endpoint(file: UploadFile = File(...)):
         if model is None:
             raise HTTPException(status_code=500, detail="Model not loaded on server")
 
+        print("📸 Received image for analysis:", file.filename)
+
         content = await file.read()
         pil = Image.open(io.BytesIO(content)).convert("RGB")
-        print("📸 Image received and opened successfully")
 
         x, base = preprocess(pil)
-        print("✅ Preprocessing done")
 
+        print("🧠 Running model inference...")
         with torch.no_grad():
             out = model(x)
-            print("✅ Model inference completed")
-
             if isinstance(out, (list, tuple)):
                 out = out[0]
             if out.shape[-1] != IMG_SIZE or out.shape[-2] != IMG_SIZE:
                 out = F.interpolate(out, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False)
             pred = torch.argmax(out, dim=1)[0].cpu().numpy().astype(np.uint8)
 
+        print("🌿 Generating overlay...")
         gvi = float((pred == 1).sum() / pred.size)
-        print(f"🌿 GVI calculated: {gvi}")
-
         over = overlay_rgba(base, pred, alpha=0.45)
+
         buf = io.BytesIO()
         over.save(buf, format="JPEG", quality=90)
         overlay_b64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
+        print(f"✅ GVI computed successfully: {gvi:.4f}")
         return JSONResponse({"gvi": gvi, "overlay": overlay_b64})
 
     except Exception as e:
-        import traceback
-        print("❌ GVI Error:", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"GVI failed: {str(e)}")
+        print("❌ GVI Error:", str(e))
+        raise HTTPException(status_code=500, detail=f"GVI processing failed: {str(e)}")
 
 # =========================================================
 # 🏠 ROOT ROUTE
