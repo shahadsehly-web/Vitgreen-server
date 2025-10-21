@@ -10,12 +10,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import bcrypt  # ✅ for password hashing
+import requests
+from io import BytesIO
 
 # =========================================================
 # 📦 MODEL CONFIGURATION
 # =========================================================
 APP_DIR = Path(__file__).parent
-MODEL_PATH = APP_DIR / "model_ts.pt"
 CFG_PATH   = APP_DIR / "model_config.json"
 USERS_FILE = APP_DIR / "users.txt"
 
@@ -25,7 +26,19 @@ MEAN     = np.array(cfg["mean"], dtype=np.float32)
 STD      = np.array(cfg["std"], dtype=np.float32)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = torch.jit.load(str(MODEL_PATH), map_location=device).eval()
+
+# ✅ Download model from Google Drive
+MODEL_URL = "https://drive.google.com/uc?export=download&id=10ITq1tMY6k6-kwRa4_SHrNs8hVxaDl06"
+
+try:
+    print("📥 Downloading model from Google Drive...")
+    response = requests.get(MODEL_URL)
+    response.raise_for_status()
+    model = torch.jit.load(BytesIO(response.content), map_location=device).eval()
+    print("✅ Model loaded successfully from Google Drive.")
+except Exception as e:
+    model = None
+    print("⚠️ Failed to load model:", e)
 
 # =========================================================
 # ⚙️ FASTAPI SETUP
@@ -92,6 +105,9 @@ def overlay_rgba(base: Image.Image, mask01: np.ndarray, alpha: float = 0.45) -> 
 
 @app.post("/gvi")
 async def gvi_endpoint(file: UploadFile = File(...)):
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded on server")
+
     content = await file.read()
     pil = Image.open(io.BytesIO(content)).convert("RGB")
 
@@ -119,4 +135,3 @@ async def gvi_endpoint(file: UploadFile = File(...)):
 @app.get("/")
 def root():
     return {"message": "VitGreen API running successfully ✅"}
-
