@@ -1,0 +1,11 @@
+# Ignore virtual environments
+.venv/
+
+# Ignore model files larger than 100MB
+model_ts.pt
+
+# Ignore Python cache
+__pycache__/
+
+# Ignore system files
+.DS_Store

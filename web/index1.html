@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Greenery GVI</title>
+<style>
+  :root { --pad:14px; --radius:14px; --brand:#2a6ef0; --bg:#0b0c0e; --card:#14161a; --muted:#aab0b8; }
+  html,body{
+    margin:0; background:var(--bg); color:#f7f7f7; /* fixed white text */
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  .wrap{padding:var(--pad);max-width:720px;margin:0 auto}
+  .card{background:var(--card);border-radius:var(--radius);padding:var(--pad);box-shadow:0 8px 24px rgba(0,0,0,.25)}
+  h1{margin:0 0 10px;font-size:18px}
+  .muted{color:var(--muted);font-size:13px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px}
+  input[type=file]{display:none}
+  .btn{background:var(--brand);color:#fff;border:0;border-radius:999px;padding:10px 14px;font-weight:600}
+  .btn:disabled{opacity:.5}
+  #overlay{max-width:100%;display:block;border-radius:12px;margin-top:10px;background:#0e1013}
+  #status{margin-top:8px;font-size:13px;color:var(--muted)}
+  .spinner{display:none;border:3px solid var(--brand);border-top-color:transparent;border-radius:50%;width:18px;height:18px;animation:spin 1s linear infinite}
+  .spinner.show{display:inline-block}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .gviBox{margin-top:10px;padding:10px;border-radius:12px;background:#0e1013}
+  .gviBig{font-size:22px;font-weight:800;color:#ffffff !important;} /* force white */
+  .bar{height:10px;border-radius:999px;background:#20242a;overflow:hidden;margin-top:8px}
+  .bar>div{height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#16a34a);transition:width .4s ease}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Greenery GVI</h1>
+    <div class="muted">Choose how to provide a photo:</div>
+    <div class="row">
+      <!-- A) Camera -->
+      <input id="pickCamera" type="file" accept="image/*" capture="environment">
+      <label class="btn" for="pickCamera">📷 Take a Photo</label>
+      <!-- B) Photo Library -->
+      <input id="pickPhoto" type="file" accept="image/*">
+      <label class="btn" for="pickPhoto">🖼️ Choose from Photos</label>
+      <span id="spin" class="spinner"></span>
+    </div>
+
+    <img id="overlay" alt="overlay will appear here" />
+    <div id="status">Waiting for a photo…</div>
+
+    <!-- GVI (fraction + percent) -->
+    <div id="gviBox" class="gviBox" style="display:none">
+      <div id="gviBig" class="gviBig">GVI: —</div>
+      <div class="bar"><div id="gviBar"></div></div>
+      <div class="muted">Green vegetation index (percentage of green pixels)</div>
+      <div class="row" style="margin-top:10px">
+        <button id="saveBtn" class="btn" disabled>💾 Save result</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Offscreen canvases -->
+<canvas id="work" width="512" height="512" style="display:none"></canvas>      <!-- resize before upload -->
+<canvas id="saveCanvas" width="512" height="512" style="display:none"></canvas> <!-- compose overlay + GVI -->
+
+<script>
+const API_URL = 'http://localhost:8000/gvi'; // ← change for phone testing: http://YOUR-MAC-IP:8000/gvi
+const SEND_SIZE = 512;
+const JPEG_QUALITY = 0.92;
+
+const pickCamera = document.getElementById('pickCamera');
+const pickPhoto  = document.getElementById('pickPhoto');
+const overlayImg = document.getElementById('overlay');
+const spinEl     = document.getElementById('spin');
+const statusEl   = document.getElementById('status');
+const gviBox     = document.getElementById('gviBox');
+const gviBig     = document.getElementById('gviBig');
+const gviBar     = document.getElementById('gviBar');
+const saveBtn    = document.getElementById('saveBtn');
+
+const canvas = document.getElementById('work');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+const saveCanvas = document.getElementById('saveCanvas');
+const saveCtx = saveCanvas.getContext('2d');
+
+let lastOverlayDataURL = null;
+let lastGviFraction = 0;
+
+pickCamera.addEventListener('change', handle);
+pickPhoto .addEventListener('change', handle);
+saveBtn   .addEventListener('click', saveResult);
+
+async function handle(e){
+  const f = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  try {
+    setLoading(true,'Preparing image…');
+    await drawFileToCanvas(f);
+    setLoading(true,'Uploading to server…');
+    const data = await sendCanvasToServer();
+    renderResult(data);
+  } catch (err) {
+    console.error(err);
+    setLoading(false,'Error: ' + (err.message || err));
+  }
+}
+
+function setLoading(b,msg){
+  b ? spinEl.classList.add('show') : spinEl.classList.remove('show');
+  statusEl.textContent = msg || '';
+}
+
+async function drawFileToCanvas(file){
+  try{
+    const bmp = await createImageBitmap(file,{ imageOrientation:'from-image' });
+    drawToSquare(bmp.width,bmp.height,bmp);
+    bmp.close?.();
+  }catch{
+    await new Promise((res,rej)=>{
+      const img = new Image(), url = URL.createObjectURL(file);
+      img.onload = ()=>{ drawToSquare(img.naturalWidth,img.naturalHeight,img); URL.revokeObjectURL(url); res(); };
+      img.onerror = ()=>{ URL.revokeObjectURL(url); rej(new Error('Image load failed')); };
+      img.src = url;
+    });
+  }
+}
+
+function drawToSquare(w,h,src){
+  canvas.width = SEND_SIZE; canvas.height = SEND_SIZE;
+  const s = Math.min(SEND_SIZE/w, SEND_SIZE/h);
+  const dw = Math.round(w*s), dh = Math.round(h*s);
+  const dx = Math.floor((SEND_SIZE - dw)/2), dy = Math.floor((SEND_SIZE - dh)/2);
+  ctx.fillStyle = '#000'; ctx.fillRect(0,0,SEND_SIZE,SEND_SIZE);
+  ctx.drawImage(src, 0,0,w,h, dx,dy,dw,dh);
+}
+
+function canvasToBlob(){ return new Promise(r=>canvas.toBlob(r,'image/jpeg',JPEG_QUALITY)); }
+
+async function sendCanvasToServer(){
+  const blob = await canvasToBlob();
+  const fd = new FormData(); fd.append('file', blob, 'capture.jpg');
+  const res = await fetch(API_URL, { method:'POST', body: fd });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Server ${res.status}: ${text.slice(0,120)}`);
+  return JSON.parse(text);
+}
+
+function renderResult(data){
+  // store + show overlay
+  lastOverlayDataURL = data.overlay;             // data:image/jpeg;base64,...
+  overlayImg.src = lastOverlayDataURL;
+
+  // numbers: show both fraction and percent
+  lastGviFraction = Number(data.gvi) || 0;
+  const pct = Math.max(0, Math.min(100, lastGviFraction*100));
+  gviBig.textContent = `GVI: ${lastGviFraction.toFixed(3)} (${pct.toFixed(1)}%)`;
+  gviBar.style.width = `${pct}%`;
+  gviBox.style.display = 'block';
+  statusEl.textContent = 'Done ✔︎';
+
+  // enable saving
+  saveBtn.disabled = false;
+}
+
+async function saveResult(){
+  if (!lastOverlayDataURL) return alert('No result to save yet.');
+
+  // draw overlay image onto save canvas
+  const img = await loadImage(lastOverlayDataURL);
+  saveCanvas.width = img.width; saveCanvas.height = img.height;
+  saveCtx.drawImage(img, 0, 0);
+
+  // add a semi-transparent label background at bottom
+  const pad = Math.round(saveCanvas.width * 0.03); // 3% padding
+  const barH = Math.round(saveCanvas.height * 0.11);
+  saveCtx.fillStyle = 'rgba(0,0,0,0.45)';
+  saveCtx.fillRect(0, saveCanvas.height - barH, saveCanvas.width, barH);
+
+  // GVI text (white, bold)
+  const pct = Math.max(0, Math.min(100, lastGviFraction*100));
+  const text = `GVI: ${lastGviFraction.toFixed(3)} (${pct.toFixed(1)}%)`;
+  saveCtx.fillStyle = '#fff';
+  saveCtx.font = `bold ${Math.round(saveCanvas.height*0.05)}px system-ui,-apple-system,Segoe UI,Roboto,sans-serif`;
+  saveCtx.textBaseline = 'middle';
+  saveCtx.fillText(text, pad, saveCanvas.height - barH/2);
+
+  // export as JPEG and trigger download
+  saveCanvas.toBlob((blob)=>{
+  if (!blob) return;
+  const url = URL.createObjectURL(blob);
+  const fname = `gvi_${ts()}.jpg`;   // <-- timestamped filename
+  const a = document.createElement('a');
+  a.href = url; a.download = fname;
+
+  // iOS fallback (may ignore custom filename)
+  if (!('download' in HTMLAnchorElement.prototype)) {
+    window.open(url, '_blank');
+  } else {
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  setTimeout(()=>URL.revokeObjectURL(url), 2000);
+}, 'image/jpeg', 0.95);
+}
+
+function loadImage(src){
+  return new Promise((res, rej)=>{
+    const i = new Image();
+    i.onload = ()=>res(i);
+    i.onerror = rej;
+    i.src = src;
+  });
+}
+function ts() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+}
+</script>
+</body>
+</html>
